@@ -55,12 +55,9 @@ def build_snapshot(client: GradeClient) -> dict:
     statistic = client.get_grade_statistic(grade_sheet_id)
 
     dept = client.get_ranking(grade_sheet_id, scope="department")
-    major = None
-    try:
-        major = client.get_ranking(grade_sheet_id, scope="major")
-    except ValueError:
-        # MAJOR_ASSOC not configured — department ranking only.
-        pass
+    # Major ranking is derived from the same department cohort (filtered by
+    # your major), so it needs no extra config.
+    major = client.get_ranking(grade_sheet_id, scope="major")
 
     return {
         "grade_sheet_id": grade_sheet_id,
@@ -68,7 +65,7 @@ def build_snapshot(client: GradeClient) -> dict:
         "grades": grades,
         "ranking": {
             "department": _rank_summary(dept),
-            "major": _rank_summary(major) if major else None,
+            "major": _rank_summary(major),
         },
     }
 

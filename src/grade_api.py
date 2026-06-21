@@ -105,15 +105,19 @@ class GradeClient:
 
     def get_ranking(
         self, grade_sheet_id: str, scope: str = "department",
-        major_assoc: str = None, student_code: str = None,
+        student_code: str = None,
     ) -> dict:
-        """Return class/department ranking.
+        """Return department or major ranking — zero config either way.
 
-        ``scope='department'`` (default) needs no extra config — the server
-        infers the student's department and grade from ``grade_sheet_id``.
-        ``scope='major'`` narrows to the student's major and needs the
-        internal ``majorAssoc`` id (set via ``MAJOR_ASSOC`` env or the
-        ``major_assoc`` arg).
+        Both scopes are derived from the single ``my-gpa/search`` call the
+        server answers with just ``studentAssoc``: the response is the full
+        department cohort (every peer's row, masked except your own), and
+        each row carries a ``major`` field.  Major ranking is just the
+        department cohort filtered to your major and re-ranked by GPA — so
+        no internal ``majorAssoc`` id is ever needed.
+
+        ``scope='department'`` returns the full cohort; ``scope='major'``
+        returns the same shape narrowed to your major.
 
         Returns::
 
@@ -129,35 +133,57 @@ class GradeClient:
         if scope not in ("department", "major"):
             raise ValueError(f"unknown scope: {scope!r}")
 
-        params: dict[str, str] = {"studentAssoc": grade_sheet_id}
-        if scope == "major":
-            major_assoc = major_assoc or config.MAJOR_ASSOC
-            if not major_assoc:
-                raise ValueError(
-                    "Major ranking needs MAJOR_ASSOC (env var) or major_assoc arg."
-                )
-            params["majorAssoc"] = major_assoc
-
         resp = self.session.get(
             f"{self.base}/student/for-std/grade/my-gpa/search",
-            params=params,
+            params={"studentAssoc": grade_sheet_id},
             timeout=60,
         )
         resp.raise_for_status()
         data = resp.json()
 
         rows = data.get("data", []) or []
-        total = int(data.get("_page_", {}).get("totalRows", len(rows)))
-
-        # The student's own row is the only one with a non-masked code/name.
         student_code = student_code or config.STUDENT_ID
         mine = next((r for r in rows if r.get("code") == student_code), None)
 
+        if scope == "major":
+            if mine is None:
+                raise RuntimeError(
+                    "Can't derive major ranking: own row not found in cohort."
+                )
+            my_major = mine.get("major")
+            rows = [r for r in rows if r.get("major") == my_major]
+            # Re-rank within the major cohort (server's `ranking` field was
+            # computed department-wide; recompute so ties share a rank).
+            _rerank_by_gpa(rows)
+
+        total = len(rows)
+        mine = next((r for r in rows if r.get("code") == student_code), mine)
         return {
             "scope": scope,
             "total": total,
-            "my_rank": mine.get("ranking") if mine else None,
-            "my_gpa": mine.get("gpa") if mine else None,
-            "my_credits": mine.get("credit") if mine else None,
+            "my_rank": (mine or {}).get("ranking"),
+            "my_gpa": (mine or {}).get("gpa"),
+            "my_credits": (mine or {}).get("credit"),
             "rows": rows,
         }
+
+
+def _rerank_by_gpa(rows: list[dict]) -> None:
+    """Assign ``ranking`` in-place by descending GPA, ties sharing a rank.
+
+    Mirrors the registrar's "dense share" convention: students with equal
+    GPA get the same rank, and the next distinct GPA jumps by the cohort
+    size in between (1,1,1,4,...) — matching what the official major-scoped
+    endpoint returns.
+    """
+    ordered = sorted(rows, key=lambda r: r.get("gpa") or 0, reverse=True)
+    rank = 0
+    prev_gpa = None
+    seen = 0
+    for row in ordered:
+        seen += 1
+        gpa = row.get("gpa")
+        if gpa != prev_gpa:
+            rank = seen
+            prev_gpa = gpa
+        row["ranking"] = rank
