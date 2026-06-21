@@ -6,3 +6,4 @@ grades.json
 *.ps1
 *.log
 *.txt
+tmp/

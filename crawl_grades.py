@@ -1,612 +1,250 @@
-import requests
-import re
+"""Fudan grade monitor — entry point.
+
+Fetches grades, GPA, and ranking from fdjwgl (over WebVPN by default, or
+directly when USE_DIRECT=1), diffs against the last encrypted snapshot,
+and emails + commits only when something actually changed.
+
+Why "only on change": GitHub auto-disables a scheduled workflow after a
+stretch of repo inactivity.  By skipping the commit when nothing moved,
+the repo stays quiet once a grade-release season ends, and the hourly
+cron winds itself down — saving public Actions minutes without manual
+intervention.
+"""
+
 import os
 import sys
-import time
-import json
-import base64
-import smtplib
-import html
-from urllib.parse import parse_qs, quote, urljoin, urlparse, unquote
-from email.mime.text import MIMEText
-from email.header import Header
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_v1_5
-from cryptography.fernet import Fernet
 
-"""
-Fudan University Grade Crawler
-Target Page: https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/
-API Endpoint: https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/info/{grade_sheet_id}
-Course Info API: https://fdjwgl.fudan.edu.cn/student/for-std/lesson-search/semester/{semester_id}/search/{grade_sheet_id}?courseCodeLike={course_code}&courseNameZhLike={course_name}&queryPage__=1%2C20
-
-Authentication:
-- Student ID and Password from environment variables StuId and UISPsw.
-- Uses Fudan UIS (Unified Identity Service) with RSA encryption.
-- Handles complex redirection chain and JS-based redirection.
-
-Features:
-- Dynamically detects student grade sheet ID.
-- Fetches grades for all semesters, including course credits.
-- Calculates GPA per semester and cumulative GPA.
-- Saves grades to an encrypted JSON file (`grades_encrypted.json`).
-- Compares current grades with previously stored grades.
-- Sends email notification if new grades are released or GPA changes (Good/Bad News).
-- Designed to run in GitHub Actions workflow.
-"""
-
-# --- Configuration ---
-GRADES_FILE = "grades_encrypted.json"
-SMTP_SERVER = 'smtp.qq.com'
-SMTP_PORT = 465 # SSL port for QQ SMTP
+from src import config
+from src.direct_session import DirectSession
+from src.emailer import send_email
+from src.encrypt import load_grades, save_grades
+from src.grade_api import GradeClient
+from src.webvpn import WebVPNSession
 
 
-def _redact_auth_params(text):
-    """Redact transient authentication parameters before logging URLs/snippets."""
-    if not text:
-        return ""
-    return re.sub(r"(?i)(lck|loginToken|ticket|SAMLRequest|SAMLResponse)=([^&#\s\"']+)", r"\1=***", text)
+def login_with_retry(max_attempts: int = 3):
+    """Build a session (WebVPN or direct) and authenticate, retrying on
+    transient gateway hiccups."""
+    use_vpn = config.USE_WEBVPN
+    label = "WebVPN" if use_vpn else "direct"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"\n[Login] {label} (attempt {attempt}/{max_attempts})...")
+            session = WebVPNSession() if use_vpn else DirectSession()
+            session.login()
+            if use_vpn:
+                # fdjwgl needs its own SSO on top of the VPN gateway session.
+                session.authenticate_grade()
+            return session
+        except Exception as e:
+            if attempt < max_attempts:
+                print(f"  Failed: {type(e).__name__}: {e}; retrying...")
+            else:
+                raise
 
 
-def _query_keys_from_url(url):
-    parsed = urlparse(url)
-    keys = set(parse_qs(parsed.query, keep_blank_values=True).keys())
-    if parsed.fragment:
-        fragment_query = parsed.fragment.split("?", 1)[1] if "?" in parsed.fragment else parsed.fragment
-        keys.update(parse_qs(fragment_query, keep_blank_values=True).keys())
-    return sorted(keys)
+# ── snapshot building + diffing ──────────────────────────────────────────
 
 
-def _summarize_url(url):
-    if not url:
-        return ""
-    url = html.unescape(url)
-    parsed = urlparse(url)
-    query_keys = ",".join(_query_keys_from_url(url)) or "-"
-    fragment_path = parsed.fragment.split("?", 1)[0] if parsed.fragment else ""
-    fragment_desc = f"#{fragment_path}" if fragment_path else ""
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}{fragment_desc} [query_keys={query_keys}]"
+def build_snapshot(client: GradeClient) -> dict:
+    """Pull every grade signal into one comparable structure."""
+    grade_sheet_id = client.discover_grade_sheet_id()
+    print(f"[*] grade sheet id: {grade_sheet_id}")
+
+    grades = client.get_all_grades(grade_sheet_id)
+    statistic = client.get_grade_statistic(grade_sheet_id)
+
+    dept = client.get_ranking(grade_sheet_id, scope="department")
+    major = None
+    try:
+        major = client.get_ranking(grade_sheet_id, scope="major")
+    except ValueError:
+        # MAJOR_ASSOC not configured — department ranking only.
+        pass
+
+    return {
+        "grade_sheet_id": grade_sheet_id,
+        "statistic": statistic,
+        "grades": grades,
+        "ranking": {
+            "department": _rank_summary(dept),
+            "major": _rank_summary(major) if major else None,
+        },
+    }
 
 
-def _extract_auth_params_from_url(url):
-    if not url:
-        return None, None
-
-    url = html.unescape(url)
-    parsed = urlparse(url)
-    query_strings = [parsed.query]
-    if parsed.fragment:
-        query_strings.append(parsed.fragment.split("?", 1)[1] if "?" in parsed.fragment else parsed.fragment)
-
-    for query_string in query_strings:
-        query = parse_qs(query_string, keep_blank_values=True)
-        lck = query.get("lck", [None])[0]
-        entity_id = query.get("entityId", [None])[0]
-        if lck and entity_id:
-            return lck, unquote(entity_id)
-
-    match_lck = re.search(r"(?:[?&#]|^)lck=([^&#]+)", url)
-    match_entity_id = re.search(r"(?:[?&#]|^)entityId=([^&#]+)", url)
-    if match_lck and match_entity_id:
-        return match_lck.group(1), unquote(match_entity_id.group(1))
-
-    return None, None
+def _rank_summary(rank: dict) -> dict:
+    return {
+        "total": rank["total"],
+        "my_rank": rank["my_rank"],
+        "my_gpa": rank["my_gpa"],
+        "my_credits": rank["my_credits"],
+    }
 
 
-def _extract_auth_params_from_response(response):
-    candidate_urls = []
-    for redirect_response in response.history:
-        candidate_urls.append(redirect_response.url)
-        location = redirect_response.headers.get("Location")
-        if location:
-            candidate_urls.append(location)
-            candidate_urls.append(urljoin(redirect_response.url, location))
-    candidate_urls.append(response.url)
-
-    for candidate_url in candidate_urls:
-        lck, entity_id = _extract_auth_params_from_url(candidate_url)
-        if lck and entity_id:
-            return lck, entity_id
-
-    page_text = html.unescape(response.text or "")
-    match_lck = re.search(r"(?:[?&#]|^)lck=([^&#\"'\s]+)", page_text)
-    match_entity_id = re.search(r"(?:[?&#]|^)entityId=([^&#\"'\s]+)", page_text)
-    if match_lck and match_entity_id:
-        return match_lck.group(1), unquote(match_entity_id.group(1))
-
-    return None, None
+def _course_signature(grades: dict) -> dict:
+    """Flatten grades into {courseCode: (name, gaGrade, gp, credits)}."""
+    sig = {}
+    for sem_grades in grades.get("semesterId2studentGrades", {}).values():
+        for entry in sem_grades:
+            code = entry.get("courseCode")
+            if not code:
+                continue
+            sig[code] = (
+                entry.get("courseName"),
+                entry.get("gaGrade"),
+                entry.get("gp"),
+                entry.get("credits"),
+            )
+    return sig
 
 
-def _format_redirect_diagnostics(response):
-    lines = ["[-] Redirect diagnostics:"]
-    chain = list(response.history) + [response]
-    for index, item in enumerate(chain):
-        line = f"    {index}. status={item.status_code} url={_summarize_url(item.url)}"
-        location = item.headers.get("Location")
-        if location:
-            line += f" location={_summarize_url(urljoin(item.url, location))}"
-        lines.append(line)
+def comparable(snapshot: dict) -> dict:
+    """Extract the fields worth diffing (stable across snapshot versions)."""
+    stat = (snapshot or {}).get("statistic", {}).get("totalStatistic", {})
+    ranking = (snapshot or {}).get("ranking", {})
+    return {
+        "courses": _course_signature((snapshot or {}).get("grades", {})),
+        "gpa": stat.get("gpa"),
+        "credits": stat.get("credits"),
+        "dept_rank": (ranking.get("department") or {}).get("my_rank"),
+        "major_rank": (ranking.get("major") or {}).get("my_rank"),
+    }
 
-    content_type = response.headers.get("Content-Type", "")
-    body_head = re.sub(r"\s+", " ", response.text[:300]).strip() if response.text else ""
-    if body_head:
-        lines.append(f"    final_content_type={content_type}")
-        lines.append(f"    final_body_head={_redact_auth_params(body_head)}")
+
+def diff_courses(old_sig: dict, new_sig: dict) -> list[dict]:
+    """Return a list of per-course changes (new / updated)."""
+    changes = []
+    for code, (name, grade, gp, _credits) in new_sig.items():
+        if code not in old_sig:
+            changes.append(
+                {"type": "new", "course": name, "grade": grade, "gp": gp}
+            )
+        elif old_sig[code][1:] != (name, grade, gp, _credits)[1:]:
+            # grade or gp changed (name/credits ignored for diff)
+            old_grade, old_gp = old_sig[code][1], old_sig[code][2]
+            changes.append(
+                {
+                    "type": "updated",
+                    "course": name,
+                    "old_grade": old_grade,
+                    "new_grade": grade,
+                    "old_gp": old_gp,
+                    "new_gp": gp,
+                }
+            )
+    return changes
+
+
+# ── notification ─────────────────────────────────────────────────────────
+
+
+def render_email(new_snap: dict, old_snap: dict, course_changes: list[dict]) -> str:
+    stat = new_snap["statistic"]["totalStatistic"]
+    old_stat = (old_snap or {}).get("statistic", {}).get("totalStatistic", {})
+    ranking = new_snap["ranking"]
+
+    lines = ["亲爱的同学：\n", "您的复旦大学成绩有更新：\n"]
+    for ch in course_changes:
+        if ch["type"] == "new":
+            gp = ch["gp"] if ch["gp"] is not None else "-"
+            lines.append(f"  · [新出分] {ch['course']}：等级 {ch['grade']}，绩点 {gp}")
+        else:
+            lines.append(
+                f"  · [更新] {ch['course']}："
+                f"{ch['old_grade']}/{ch['old_gp']} → {ch['new_grade']}/{ch['new_gp']}"
+            )
+
+    lines.append("")
+    lines.append(f"累计 GPA：{stat.get('gpa')}（学分 {stat.get('credits')}，{stat.get('count')} 门）")
+    old_gpa = old_stat.get("gpa")
+    if old_gpa and old_gpa != stat.get("gpa"):
+        arrow = "↑" if float(stat.get("gpa", 0)) > float(old_gpa) else "↓"
+        lines.append(f"GPA 变化：{old_gpa} {arrow} {stat.get('gpa')}")
+
+    dept = ranking.get("department") or {}
+    if dept.get("my_rank") is not None:
+        lines.append(f"院系排名：{dept['my_rank']}/{dept['total']}")
+    major = ranking.get("major") or {}
+    if major.get("my_rank") is not None:
+        lines.append(f"专业排名：{major['my_rank']}/{major['total']}")
+
     return "\n".join(lines)
 
 
-def _extract_client_redirect_url(response):
-    page_text = html.unescape(response.text or "")
-    patterns = [
-        r'var\s+locationValue\s*=\s*["\']([^"\']+)["\']',
-        r'(?:window\.)?location(?:\.href)?\s*=\s*["\']([^"\']+)["\']',
-        r'(?:window\.)?location\.replace\(\s*["\']([^"\']+)["\']\s*\)',
-        r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\'][^"\']*url=([^"\']+)["\']',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, page_text, flags=re.IGNORECASE)
-        if match:
-            return urljoin(response.url, match.group(1).replace("&amp;", "&"))
-    return None
-
-
-def _follow_client_redirects(session, response, max_hops=3):
-    for _ in range(max_hops):
-        next_url = _extract_client_redirect_url(response)
-        if not next_url:
-            break
-        response = session.get(next_url, allow_redirects=True, timeout=30)
-    return response
-
-
-def _extract_grade_sheet_id(response):
-    candidates = [response.url, html.unescape(response.text or "")]
-    patterns = [
-        r"semester-index/(\d+)",
-        r"grade/sheet/info/(\d+)",
-        r"gradeSheetId[\"'\s:=]+(\d+)",
-    ]
-    for candidate in candidates:
-        for pattern in patterns:
-            match = re.search(pattern, candidate)
-            if match:
-                return match.group(1)
-    return None
-
-
-def _build_uis_bootstrap_url():
-    target_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/"
-    service_url = f"https://fdjwgl.fudan.edu.cn/student/sso/login?refer={target_url}"
-    return f"https://id.fudan.edu.cn/idp/authCenter/authenticate?service={quote(service_url, safe='')}"
-
-
-def get_encryption_key():
-    """Generates a Fernet key from 4 environment variables to prevent collision."""
-    stu_id = os.environ.get("StuId", "")
-    password = os.environ.get("UISPsw", "")
-    sender = os.environ.get("QQ_EMAIL_SENDER", "")
-    smtp = os.environ.get("QQ_SMTP", "")
-    
-    # Combine variables with separators to ensure uniqueness
-    raw_key = f"{stu_id}|{password}|{sender}|{smtp}"
-    
-    # Use SHA256 hash to derive a 32-byte key for Fernet
-    import hashlib
-    key = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode('utf-8')).digest())
-    return key
-
-def encrypt_data(data, key):
-    """Encrypts data using Fernet symmetric encryption."""
-    f = Fernet(key)
-    return f.encrypt(json.dumps(data, ensure_ascii=False).encode('utf-8'))
-
-def decrypt_data(encrypted_data, key):
-    """Decrypts data using Fernet symmetric encryption."""
-    f = Fernet(key)
-    return json.loads(f.decrypt(encrypted_data).decode('utf-8'))
-
-def encrypt_password(password, public_key_b64):
-    """Encrypt password using RSA PKCS1_v1_5 as used by JSEncrypt."""
-    key_der = base64.b64decode(public_key_b64)
-    public_key = RSA.import_key(key_der)
-    cipher = PKCS1_v1_5.new(public_key)
-    encrypted_pw = cipher.encrypt(password.encode('utf-8'))
-    return base64.b64encode(encrypted_pw).decode('utf-8')
-
-def send_email(subject, body, recipient_email, sender_email, smtp_auth_code):
-    """Sends an email notification."""
-    if not sender_email or not smtp_auth_code:
-        print(f"[-] Error: Sender email and SMTP auth code must be provided for email notification.")
-        return
-
-    message = MIMEText(body, 'plain', 'utf-8')
-    message['From'] = Header(f"Fudan Grade Monitor <{sender_email}>")
-    message['To'] = Header(recipient_email)
-    message['Subject'] = Header(subject)
-
+def email_subject(course_changes: list[dict], old_gpa, new_gpa) -> str:
+    prefix = "【自动推送】"
     try:
-        smtp_obj = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-        smtp_obj.login(sender_email, smtp_auth_code)
-        smtp_obj.sendmail(sender_email, recipient_email, message.as_string())
-        smtp_obj.quit()
-        print(f"[+] Email notification sent to {recipient_email}")
-    except Exception as e:
-        print(f"[-] Error sending email: {e}")
+        if new_gpa and old_gpa and float(new_gpa) > float(old_gpa):
+            prefix += "好消息！"
+        elif new_gpa and old_gpa and float(new_gpa) < float(old_gpa):
+            prefix += "坏消息！"
+        elif course_changes:
+            prefix += "成绩更新！"
+    except (TypeError, ValueError):
+        prefix += "成绩更新！"
+    names = "/".join(c["course"] for c in course_changes[:3])
+    return f"{prefix}{names or '成绩'}出分了"
 
-def get_course_credits(session, semester_id, grade_sheet_id, course_code, course_name):
-    """Fetches course credits using the new course info API."""
-    # The API expects Chinese characters in courseNameZhLike to be URL-encoded
-    course_name_encoded = requests.utils.quote(course_name)
-    course_info_api = f"https://fdjwgl.fudan.edu.cn/student/for-std/lesson-search/semester/{semester_id}/search/{grade_sheet_id}?courseCodeLike={course_code}&courseNameZhLike={course_name_encoded}&queryPage__=1%2C20"
-    
-    try:
-        res = session.get(course_info_api)
-        data = res.json()
-        if data and data.get('data'):
-            # The API returns a list of courses, pick the first one matching the code
-            for course_entry in data['data']:
-                if course_entry.get('course') and course_entry['course'].get('code') == course_code:
-                    return course_entry['course'].get('credits')
-        # Fallback if specific course not found by code, try by name
-        if data and data.get('data'):
-            for course_entry in data['data']:
-                if course_entry.get('course') and course_entry['course'].get('nameZh') == course_name:
-                    return course_entry['course'].get('credits')
-    except Exception as e:
-        # print(f"[-] Error fetching credits for {course_name} ({course_code}): {e}")
-        pass # Suppress error for not finding credits, it might not exist for some courses
-    return None # Return None if credits not found
 
-def calculate_gpa(grades_data_map):
-    """Calculates cumulative GPA from grades data."""
-    total_gp_x_credits = 0.0
-    total_credits = 0.0
+# ── main ─────────────────────────────────────────────────────────────────
 
-    for semester_grades in grades_data_map.values():
-        for grade_entry in semester_grades:
-            gp = grade_entry.get('gp')
-            credits = grade_entry.get('credits')
-            grade = grade_entry.get('gaGrade')
-
-            # Exclude P/NP grades from GPA calculation
-            if grade in ['P', 'NP']:
-                continue
-
-            if gp is not None and credits is not None and credits > 0:
-                total_gp_x_credits += float(gp) * float(credits)
-                total_credits += float(credits)
-    
-    if total_credits > 0:
-        return round(total_gp_x_credits / total_credits, 3)
-    return 0.0
-
-def crawl_grades():
-    stu_id = os.environ.get('StuId')
-    password = os.environ.get('UISPsw') # UISPsw will also be used as encryption key
-
-    if not stu_id or not password:
-        print("[-] Error: Environment variables StuId and UISPsw must be set.")
-        sys.exit(1)
-
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    })
-
-    # Step 1: Access target page to trigger redirection to UIS
-    target_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/"
-    print(f"[*] Accessing {target_url}...")
-    try:
-        res = session.get(target_url, allow_redirects=True, timeout=30)
-    except Exception as e:
-        raise Exception(f"[-] Network error: {e}")
-    
-    # Extract lck and entityId from the UIS redirect chain. On some runners,
-    # requests may drop the URL fragment from res.url, so inspect Location too.
-    lck, entityId = _extract_auth_params_from_response(res)
-
-    if not lck or not entityId:
-        print("[*] Target page did not redirect to UIS. Trying direct UIS bootstrap...")
-        print(_format_redirect_diagnostics(res))
-        try:
-            res_bootstrap = session.get(_build_uis_bootstrap_url(), allow_redirects=True, timeout=30)
-        except Exception as e:
-            raise Exception(f"[-] UIS bootstrap network error: {e}")
-        lck, entityId = _extract_auth_params_from_response(res_bootstrap)
-
-        if not lck or not entityId:
-            print(_format_redirect_diagnostics(res_bootstrap))
-            raise Exception("[-] Failed to get authentication parameters from redirect URL.")
-
-    # Step 2: Query authentication methods to get authChainCode
-    print("[*] Querying authentication methods...")
-    query_url = "https://id.fudan.edu.cn/idp/authn/queryAuthMethods"
-    try:
-        res_query = session.post(query_url, json={"lck": lck, "entityId": entityId})
-        query_data = res_query.json()
-        auth_chain_code = query_data['data'][0]['authChainCode']
-        request_type = query_data['requestType']
-    except Exception as e:
-        raise Exception(f"[-] Failed to query auth methods: {e}")
-
-    # Step 3: Get RSA public key for password encryption
-    print("[*] Retrieving RSA public key...")
-    pub_key_url = "https://id.fudan.edu.cn/idp/authn/getJsPublicKey"
-    try:
-        res_pub = session.post(pub_key_url)
-        pub_key = res_pub.json()['data']
-    except Exception as e:
-        raise Exception(f"[-] Failed to get public key: {e}")
-
-    # Step 4: Encrypt password
-    encrypted_password_uis = encrypt_password(password, pub_key)
-
-    # Step 5: Execute authentication
-    print("[*] Authenticating...")
-    execute_url = "https://id.fudan.edu.cn/idp/authn/authExecute"
-    payload = {
-        "authModuleCode": "userAndPwd",
-        "authChainCode": auth_chain_code,
-        "entityId": entityId,
-        "requestType": request_type,
-        "lck": lck,
-        "authPara": {
-            "loginName": stu_id,
-            "password": encrypted_password_uis,
-            "verifyCode": ""
-        }
-    }
-    try:
-        res_execute = session.post(execute_url, json=payload)
-        execute_data = res_execute.json()
-    except Exception as e:
-        raise Exception(f"[-] Authentication request failed: {e}")
-
-    if execute_data.get('code') != 200 and execute_data.get('code') != "200":
-        raise Exception(f"[-] Authentication failed: {execute_data.get('message')}")
-
-    login_token = execute_data['loginToken']
-
-    # Step 6: Submit loginToken to authnEngine and handle JS redirect
-    print("[*] Finalizing session...")
-    engine_url = "https://id.fudan.edu.cn/idp/authCenter/authnEngine"
-    try:
-        res_engine = session.post(engine_url, data={"loginToken": login_token})
-        
-        # Extract locationValue from JS redirect script
-        match_loc = re.search(r'var locationValue = "([^"]+)"', res_engine.text)
-        if not match_loc:
-            raise Exception("[-] Failed to find redirection link in authentication engine response.")
-        
-        redirect_url = match_loc.group(1).replace('&amp;', '&')
-        # Visit the redirect URL to set cookies for the student system
-        res_final = session.get(redirect_url, allow_redirects=True, timeout=30)
-        res_final = _follow_client_redirects(session, res_final)
-        print(f"[+] Login final redirection: {_summarize_url(res_final.url)}")
-    except Exception as e:
-        raise Exception(f"[-] Session finalization failed: {e}")
-
-    # Add a short delay to ensure the session is fully established on the server side
-    time.sleep(1)
-
-    # Step 7: Dynamically find the grade sheet ID
-    grade_base_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/"
-    print("[*] Detecting student grade sheet ID...")
-    try:
-        res_detect = session.get(grade_base_url, allow_redirects=True, timeout=30)
-        res_detect = _follow_client_redirects(session, res_detect)
-        grade_sheet_id = _extract_grade_sheet_id(res_detect)
-        if not grade_sheet_id:
-            print(_format_redirect_diagnostics(res_detect))
-            raise Exception(f"[-] Failed to detect grade sheet ID. Final URL was: {_summarize_url(res_detect.url)}")
-        else:
-            print(f"[+] Detected grade sheet ID")
-    except Exception as e:
-        raise Exception(f"[-] Error detecting grade sheet ID: {e}")
-
-    # Step 8: Fetch grades from API
-    grade_api = f"https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/info/{grade_sheet_id}"
-    print(f"[*] Fetching all grades...")
-    try:
-        res_grades = session.get(grade_api)
-        if res_grades.status_code == 200:
-            grades_data = res_grades.json()
-            
-            # Step 9: Fetch credits for each course
-            print("[*] Fetching course credits...")
-            all_grades_with_credits = {}
-            for semester_id_str, semester_grades in grades_data['semesterId2studentGrades'].items():
-                semester_id = int(semester_id_str)
-                all_grades_with_credits[semester_id_str] = []
-                for grade_entry in semester_grades:
-                    course_code = grade_entry.get('courseCode')
-                    course_name = grade_entry.get('courseName')
-                    if course_code and course_name:
-                        credits = get_course_credits(session, semester_id, grade_sheet_id, course_code, course_name)
-                        grade_entry['credits'] = credits
-                    else:
-                        grade_entry['credits'] = None
-                    all_grades_with_credits[semester_id_str].append(grade_entry)
-            grades_data['semesterId2studentGrades'] = all_grades_with_credits
-
-            print("[+] Grades and credits fetched successfully!")
-            return grades_data
-        else:
-            raise Exception(f"[-] Failed to fetch grades. Status code: {res_grades.status_code}")
-    except Exception as e:
-        raise Exception(f"[-] Error fetching grades: {e}")
-    return None
-
-def compare_and_notify(new_grades_data):
-    """Compares new grades with old, calculates GPA, and sends notifications."""
-    sender_email = os.environ.get("QQ_EMAIL_SENDER")
-    stu_id = os.environ.get("StuId")
-    recipient_email = f"{stu_id}@m.fudan.edu.cn" if stu_id else None
-    smtp_auth_code = os.environ.get("QQ_SMTP")
-
-    # UISPsw is needed for key generation implicitly by get_encryption_key
-    # We check required vars for email and basic logic here
-    if not smtp_auth_code:
-        print(f"[-] Error: QQ_SMTP environment variable must be set for email notification.")
-        return
-    if not sender_email:
-        print("[-] Error: QQ_EMAIL_SENDER environment variable must be set.")
-        return
-    if not stu_id:
-        print("[-] Error: StuId environment variable must be set to determine recipient email.")
-        return
-
-    key = get_encryption_key()
-
-    old_grades_data = {}
-    if os.path.exists(GRADES_FILE):
-        print(f"[*] Loading old grades from {GRADES_FILE}...")
-        try:
-            with open(GRADES_FILE, "rb") as f:
-                encrypted_old_grades = f.read()
-            old_grades_data = decrypt_data(encrypted_old_grades, key)
-        except Exception as e:
-            print(f"[-] Error decrypting old grades: {e}. Starting fresh.")
-            old_grades_data = {}
-    else:
-        print("[*] No existing grades file found. This is the first run.")
-
-    # Calculate current and old GPA
-    current_gpa = calculate_gpa(new_grades_data['semesterId2studentGrades'])
-    old_gpa = calculate_gpa(old_grades_data.get('semesterId2studentGrades', {}))
-
-    # Identify new grades
-    new_grades_found = []
-    
-    # Flatten old grades for easier lookup (courseCode -> grade_entry)
-    old_grades_flat = {}
-    for semester_grades in old_grades_data.get('semesterId2studentGrades', {}).values():
-        for grade_entry in semester_grades:
-            old_grades_flat[grade_entry['courseCode']] = grade_entry
-    
-    for semester_id, new_semester_grades in new_grades_data['semesterId2studentGrades'].items():
-        for new_grade_entry in new_semester_grades:
-            course_code = new_grade_entry['courseCode']
-            old_grade_entry = old_grades_flat.get(course_code)
-
-            if old_grade_entry is None:
-                new_grades_found.append({
-                    "courseName": new_grade_entry['courseName'],
-                    "gaGrade": new_grade_entry['gaGrade'],
-                    "gp": new_grade_entry['gp'],
-                    "changeType": "new"
-                })
-            elif old_grade_entry.get('gaGrade') != new_grade_entry.get('gaGrade') or old_grade_entry.get('gp') != new_grade_entry.get('gp'):
-                 new_grades_found.append({
-                    "courseName": new_grade_entry['courseName'],
-                    "old_gaGrade": old_grade_entry.get('gaGrade'),
-                    "new_gaGrade": new_grade_entry['gaGrade'],
-                    "old_gp": old_grade_entry.get('gp'),
-                    "new_gp": new_grade_entry['gp'],
-                    "changeType": "updated"
-                })
-
-    # Prepare email notification if changes found
-    if new_grades_found:
-        print("[+] New or updated grades found! Preparing email notification.")
-        subject_prefix = "【自动推送】"
-        if current_gpa > old_gpa:
-            subject_prefix += "好消息！"
-        elif current_gpa < old_gpa:
-            subject_prefix += "坏消息！"
-        else:
-            subject_prefix += "成绩更新！"
-        
-        email_body = f"亲爱的同学：\n\n您的复旦大学成绩有新的更新：\n\n"
-        for grade_change in new_grades_found:
-            if grade_change['changeType'] == "new":
-                email_body += f"课程：{grade_change['courseName']} 出分了！\n"
-                email_body += f"  等级：{grade_change['gaGrade']}\n"
-                email_body += f"  绩点：{grade_change['gp'] if grade_change['gp'] is not None else '-'}\n"
-            elif grade_change['changeType'] == "updated":
-                email_body += f"课程：{grade_change['courseName']} 成绩更新了！\n"
-                email_body += f"  原有等级：{grade_change['old_gaGrade'] if grade_change['old_gaGrade'] is not None else '-'}\n"
-                email_body += f"  新等级：{grade_change['new_gaGrade']}\n"
-                email_body += f"  原有绩点：{grade_change['old_gp'] if grade_change['old_gp'] is not None else '-'}\n"
-                email_body += f"  新绩点：{grade_change['new_gp'] if grade_change['new_gp'] is not None else '-'}\n"
-            email_body += "\n"
-        
-        email_body += f"您当前的累计GPA为：{current_gpa:.3f}\n"
-        if old_gpa > 0:
-            email_body += f"您上次的累计GPA为：{old_gpa:.3f}\n"
-        if current_gpa != old_gpa:
-            email_body += f"GPA变化：{'↑' if current_gpa > old_gpa else '↓'}{abs(current_gpa - old_gpa):.3f}\n"
-
-        send_email(subject_prefix + f"{'/'.join([g['courseName'] for g in new_grades_found])}课程出分了！", email_body, recipient_email, sender_email, smtp_auth_code)
-    else:
-        print("[*] No new or updated grades found.")
-
-    # Save new grades (encrypted)
-    encrypted_new_grades = encrypt_data(new_grades_data, key)
-    with open(GRADES_FILE, "wb") as f:
-        f.write(encrypted_new_grades)
-    print(f"[+] New grades (encrypted) saved to {GRADES_FILE}")
-
-def format_grades(data):
-    """Helper to display grades in a readable format and print GPA."""
-    semesters_list = data.get('semesters', [])
-    grades_map = data.get('semesterId2studentGrades', {})
-    
-    all_gpa = calculate_gpa(grades_map)
-
-    print(f"--- Cumulative GPA: {all_gpa:.3f} ---\n")
-
-    for semester in semesters_list:
-        s_id = str(semester['id'])
-        s_name = semester['nameZh']
-        print(f"=== {s_name} ===")
-        semester_grades = grades_map.get(s_id, [])
-        
-        semester_total_gp_x_credits = 0.0
-        semester_total_credits = 0.0
-
-        if not semester_grades:
-            print("  (No grades recorded)")
-        else:
-            print(f"{ 'Course Code':<12} { 'Course Name':<30} { 'Grade':<6} { 'GP':<5} { 'Credits':<7}")
-            print("-" * 70)
-            for g in semester_grades:
-                code = g.get('courseCode', '-')
-                name = g.get('courseName', '-')
-                grade = g.get('gaGrade', '-')
-                gp = g.get('gp')
-                credits = g.get('credits')
-
-                if gp is None: gp_display = '-'
-                else: gp_display = f"{gp:.3f}"
-                if credits is None: credits_display = '-'
-                else: credits_display = f"{credits:.1f}"
-
-                # Exclude P/NP from calculation
-                if grade not in ['P', 'NP'] and gp is not None and credits is not None and credits > 0:
-                    semester_total_gp_x_credits += float(gp) * float(credits)
-                    semester_total_credits += float(credits)
-
-                # Handle Chinese characters in alignment (approximate)
-                print(f"{code:<12} {name[:25]:<30} {grade:<6} {gp_display:<5} {credits_display:<7}")
-        
-        semester_gpa = 0.0
-        if semester_total_credits > 0:
-            semester_gpa = round(semester_total_gp_x_credits / semester_total_credits, 3)
-        print(f"  Semester GPA: {semester_gpa:.3f}")
-        print()
 
 def main():
-    # UISPsw is still needed for login
-    uis_password = os.environ.get('UISPsw')
-    if not uis_password:
-        print("[-] Error: UISPsw environment variable must be set.")
+    if not config.STUDENT_ID or not config.PASSWORD:
+        print("[-] Error: StuId and UISPsw environment variables must be set.")
         sys.exit(1)
 
-    new_grades_data = crawl_grades()
-    if new_grades_data:
-        # format_grades(new_grades_data)
-        compare_and_notify(new_grades_data)
+    session = login_with_retry()
+    client = GradeClient(session)
+
+    new_snap = build_snapshot(client)
+    old_snap = load_grades()
+
+    old_comp = comparable(old_snap)
+    new_comp = comparable(new_snap)
+
+    course_changes = diff_courses(old_comp["courses"], new_comp["courses"])
+    gpa_changed = old_comp["gpa"] != new_comp["gpa"]
+    rank_changed = (
+        old_comp["dept_rank"] != new_comp["dept_rank"]
+        or old_comp["major_rank"] != new_comp["major_rank"]
+    )
+
+    is_first_run = not old_snap
+    anything_changed = bool(course_changes) or gpa_changed or rank_changed
+
+    if not anything_changed and not is_first_run:
+        print("[*] No changes since last run — snapshot left untouched.")
+        return
+
+    # Build + send notification.
+    stat = new_snap["statistic"]["totalStatistic"]
+    if is_first_run:
+        # First run: don't spam every historical course; just confirm init.
+        body = (
+            "成绩监控已初始化。\n\n"
+            f"累计 GPA：{stat.get('gpa')}（学分 {stat.get('credits')}，{stat.get('count')} 门）\n"
+        )
+        dept = new_snap["ranking"].get("department") or {}
+        if dept.get("my_rank") is not None:
+            body += f"院系排名：{dept['my_rank']}/{dept['total']}\n"
+        major = new_snap["ranking"].get("major") or {}
+        if major.get("my_rank") is not None:
+            body += f"专业排名：{major['my_rank']}/{major['total']}\n"
+        send_email("【自动推送】成绩监控已启动", body)
+    else:
+        body = render_email(new_snap, old_snap, course_changes)
+        subject = email_subject(
+            course_changes, old_comp["gpa"], new_comp["gpa"]
+        )
+        send_email(subject, body)
+
+    # Persist — only when something actually moved, so the workflow can
+    # skip the commit and let the repo go idle after grade season.
+    if anything_changed or is_first_run:
+        save_grades(new_snap)
+
 
 if __name__ == "__main__":
     main()
