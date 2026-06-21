@@ -16,6 +16,7 @@ plus the per-host SSO handshake fdjwgl needs.
 import html as html_mod
 import re
 import base64
+import time
 from binascii import hexlify, unhexlify
 from urllib.parse import urlparse, quote, urljoin
 
@@ -239,6 +240,25 @@ class WebVPNSession:
 
         entity_id = config.GRADE_BASE
         idp_vpn_base = get_vpn_url(config.IDP_BASE)
+
+        # Pre-flight: the WebVPN gateway is load-balanced (the ``route``
+        # cookie) and a newly authenticated session may land on a backend
+        # that does not yet hold it, 302-ing us to ``/login``.  Probe the
+        # portal root: a warm session returns 200; a cold one 302s.  Try a
+        # couple of times with a small delay — a single hit to the wrong
+        # backend is a transient routing miss and not worth a full re-login.
+        # If still cold after those tries, signal ``login_with_retry`` to
+        # re-authenticate.
+        for _ in range(3):
+            warmup = self.session.get(
+                config.WEBVPN_BASE + "/", allow_redirects=False, timeout=15,
+            )
+            loc = warmup.headers.get("Location") or ""
+            if warmup.status_code == 200 and "/login" not in loc:
+                break
+            time.sleep(2)
+        else:
+            raise RuntimeError("WebVPN session cold — re-login needed")
 
         print("[grade/1] Triggering fdjwgl SSO redirect...")
         resp = self.session.get(

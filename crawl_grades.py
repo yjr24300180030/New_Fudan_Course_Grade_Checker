@@ -13,6 +13,7 @@ intervention.
 
 import os
 import sys
+import time
 
 from src import config
 from src.direct_session import DirectSession
@@ -22,9 +23,9 @@ from src.grade_api import GradeClient
 from src.webvpn import WebVPNSession
 
 
-def login_with_retry(max_attempts: int = 3):
+def login_with_retry(max_attempts: int = 5):
     """Build a session (WebVPN or direct) and authenticate, retrying on
-    transient gateway hiccups."""
+    transient gateway hiccups with exponential backoff."""
     use_vpn = config.USE_WEBVPN
     label = "WebVPN" if use_vpn else "direct"
     for attempt in range(1, max_attempts + 1):
@@ -38,7 +39,10 @@ def login_with_retry(max_attempts: int = 3):
             return session
         except Exception as e:
             if attempt < max_attempts:
-                print(f"  Failed: {type(e).__name__}: {e}; retrying...")
+                wait = 4 * (2 ** (attempt - 1))  # 4, 8, 16, 32 seconds
+                print(f"  Failed: {type(e).__name__}: {e}; "
+                      f"retrying in {wait}s...")
+                time.sleep(wait)
             else:
                 raise
 
