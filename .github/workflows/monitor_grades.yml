@@ -36,6 +36,7 @@ jobs:
         UISPsw: ${{ secrets.UIS_PASSWORD }}
         QQ_SMTP: ${{ secrets.QQ_SMTP_AUTH_CODE }}
         QQ_EMAIL_SENDER: ${{ secrets.QQ_EMAIL_SENDER }}
+        RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
         # Default: access fdjwgl through WebVPN (GitHub runners are off-campus).
         # The crawler only rewrites grades_encrypted.json when data changes.
       run: python crawl_grades.py

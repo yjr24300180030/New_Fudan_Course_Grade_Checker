@@ -42,6 +42,7 @@
 | `UIS_PASSWORD` | ✅ | 你的 UIS 登录密码 | `MySecretPass123` |
 | `QQ_EMAIL_SENDER` | ✅ | 发送通知的 QQ 邮箱地址 | `12345678@qq.com` |
 | `QQ_SMTP_AUTH_CODE` | ✅ | QQ 邮箱的 SMTP 授权码* | `abcdefghijklmnop` |
+| `RECEIVER_EMAIL` | ❌ | 接收通知的邮箱；不填则默认发送到你的复旦邮箱 | `yourname@example.com` |
 
 > **如何获取 QQ SMTP 授权码**:
 > 登录 QQ 邮箱网页版 -> 设置 -> 账号 -> 向下滚动找到 "POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV服务" -> 开启服务 -> 生成授权码。
